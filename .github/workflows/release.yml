@@ -30,7 +30,7 @@ jobs:
         run: >
           pyinstaller
           --onefile
-          --console
+          --windowed
           --name Ellie
           --collect-all faster_whisper
           --collect-all ctranslate2

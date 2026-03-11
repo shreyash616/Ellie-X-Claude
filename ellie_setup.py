@@ -14,6 +14,7 @@ import winreg
 
 APP_NAME = "Ellie"
 _STARTUP_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_APP_KEY = r"Software\Ellie"
 
 
 def _exe_path() -> str:
@@ -21,6 +22,25 @@ def _exe_path() -> str:
     if getattr(sys, "frozen", False):
         return sys.executable
     return os.path.abspath(__file__)
+
+
+def _setup_done() -> bool:
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _APP_KEY)
+        winreg.QueryValueEx(key, "SetupDone")
+        winreg.CloseKey(key)
+        return True
+    except OSError:
+        return False
+
+
+def _mark_setup_done() -> None:
+    try:
+        key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, _APP_KEY)
+        winreg.SetValueEx(key, "SetupDone", 0, winreg.REG_DWORD, 1)
+        winreg.CloseKey(key)
+    except Exception:
+        pass
 
 
 def _register_startup(exe_path: str) -> bool:
@@ -40,38 +60,54 @@ def _register_startup(exe_path: str) -> bool:
 
 
 def main() -> None:
-    print("=" * 52)
-    print("  Ellie — Setup")
-    print("=" * 52)
-    print()
+    import ctypes
 
-    # ── Startup question ────────────────────────────────────────────────────
-    print("Would you like Ellie to start automatically when Windows starts?")
-    while True:
-        answer = input("  [y/n]: ").strip().lower()
-        if answer in ("y", "yes", "n", "no"):
-            break
-        print("  Please enter y or n.")
+    # ── Skip setup if already configured ────────────────────────────────────
+    if not _setup_done():
+        kernel32 = ctypes.windll.kernel32
 
-    print()
+        # Only allocate a console if one isn't already attached (i.e. windowed exe)
+        allocated = False
+        if not kernel32.GetConsoleWindow():
+            kernel32.AllocConsole()
+            sys.stdout = open("CONOUT$", "w")
+            sys.stdin = open("CONIN$", "r")
+            sys.stderr = open("CONOUT$", "w")
+            allocated = True
 
-    if answer in ("y", "yes"):
-        if _register_startup(_exe_path()):
-            print("  ✓ Ellie will now start automatically with Windows.")
-    else:
-        print("  Ellie will not start automatically.")
-        print("  You can run Ellie.exe directly at any time.")
+        print("=" * 52)
+        print("  Ellie — Setup")
+        print("=" * 52)
+        print()
+
+        # ── Startup question ─────────────────────────────────────────────────
+        print("Would you like Ellie to start automatically when Windows starts?")
+        while True:
+            answer = input("  [y/n]: ").strip().lower()
+            if answer in ("y", "yes", "n", "no"):
+                break
+            print("  Please enter y or n.")
+
+        print()
+
+        if answer in ("y", "yes"):
+            if _register_startup(_exe_path()):
+                print("  ✓ Ellie will now start automatically with Windows.")
+        else:
+            print("  Ellie will not start automatically.")
+            print("  You can run Ellie.exe directly at any time.")
+
+        _mark_setup_done()
+
+        if allocated:
+            sys.stdout.close()
+            sys.stdin.close()
+            sys.stdout = sys.__stdout__
+            sys.stdin = sys.__stdin__
+            sys.stderr = sys.__stderr__
+            kernel32.FreeConsole()
 
     # ── Launch main app ─────────────────────────────────────────────────────
-    print()
-    print("  Starting Ellie...")
-
-    # Hide the console window before the GUI takes over
-    import ctypes
-    hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-    if hwnd:
-        ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
-
     from ellie_claude import EllieApp
     EllieApp()
 
