@@ -8,8 +8,11 @@ Opens a terminal, asks whether to register Ellie to run at Windows startup,
 then hides the console and launches the main GUI.
 """
 
+import itertools
 import os
 import sys
+import threading
+import time
 import winreg
 
 APP_NAME = "Ellie"
@@ -98,7 +101,27 @@ def main() -> None:
             print("  You can run Ellie.exe directly at any time.")
 
         _mark_setup_done()
+        print()
 
+        # ── Loader spinner while heavy dependencies are imported ─────────────
+        stop_spinner = threading.Event()
+
+        def _spinner() -> None:
+            frames = itertools.cycle(r"-\|/")
+            while not stop_spinner.is_set():
+                print(f"\r  Loading {next(frames)} ", end="", flush=True)
+                time.sleep(0.1)
+            print("\r  ✓ Starting Ellie ...      ")
+
+        t = threading.Thread(target=_spinner, daemon=True)
+        t.start()
+
+        from ellie_claude import EllieApp  # heavy import happens here
+
+        stop_spinner.set()
+        t.join()
+
+        # Close the console before the GUI starts
         if allocated:
             sys.stdout.close()
             sys.stdin.close()
@@ -106,9 +129,15 @@ def main() -> None:
             sys.stdin = sys.__stdin__
             sys.stderr = sys.__stderr__
             kernel32.FreeConsole()
+        else:
+            # Hide the terminal window we were launched from
+            hwnd = kernel32.GetConsoleWindow()
+            if hwnd:
+                ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
+    else:
+        from ellie_claude import EllieApp
 
     # ── Launch main app ─────────────────────────────────────────────────────
-    from ellie_claude import EllieApp
     EllieApp()
 
 
