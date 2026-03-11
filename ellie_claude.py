@@ -45,10 +45,10 @@ from winpty import PtyProcess  # noqa: E402
 # ── Constants ─────────────────────────────────────────────────────────────────
 SAMPLE_RATE = 16_000
 HOTKEY = "f9"
-WAKE_MODEL_SIZE = "tiny.en"
+WAKE_MODEL_SIZE = "base.en"
 WAKE_WORD_USER = "okay ellie"
-WAKE_WORD = "ellie"
-WAKE_WINDOW_S = 2.0
+WAKE_WORDS = {"ellie", "eli", "elly", "elie", "allie", "ollie"}
+WAKE_WINDOW_S = 2.5
 WAKE_STEP_S = 0.5
 APP_NAME = "ellie_claude"
 FONT_SIZE = 11
@@ -1074,16 +1074,16 @@ class EllieApp:
                 try:
                     segs, _ = self._wake_model.transcribe(
                         buf_snapshot,
-                        beam_size=1,
+                        beam_size=3,
                         language="en",
                         condition_on_previous_text=False,
-                        no_speech_threshold=0.7,
+                        no_speech_threshold=0.6,
                     )
-                    heard = " ".join(s.text for s in segs).lower()
+                    heard = " ".join(s.text for s in segs).lower().split()
                 except Exception:
                     continue
 
-                if WAKE_WORD in heard:
+                if any(w in WAKE_WORDS for w in heard):
                     break
 
             with self._lock:
