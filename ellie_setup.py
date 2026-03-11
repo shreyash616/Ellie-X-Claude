@@ -104,14 +104,23 @@ def main() -> None:
         print()
 
         # ── Loader spinner while heavy dependencies are imported ─────────────
+        # Enable ANSI color codes in the console
+        _handle = ctypes.windll.kernel32.GetStdHandle(-11)
+        _mode = ctypes.c_ulong()
+        ctypes.windll.kernel32.GetConsoleMode(_handle, ctypes.byref(_mode))
+        ctypes.windll.kernel32.SetConsoleMode(_handle, _mode.value | 0x0004)
+
+        _CYAN = "\033[96m"
+        _RESET = "\033[0m"
+
         stop_spinner = threading.Event()
 
         def _spinner() -> None:
             frames = itertools.cycle(r"-\|/")
             while not stop_spinner.is_set():
-                print(f"\r  Loading {next(frames)} ", end="", flush=True)
+                print(f"\r  {_CYAN}Loading {next(frames)}{_RESET} ", end="", flush=True)
                 time.sleep(0.1)
-            print("\r  ✓ Starting Ellie ...      ")
+            print(f"\r  {_CYAN}✓ Starting Ellie ...{_RESET}      ")
 
         t = threading.Thread(target=_spinner, daemon=True)
         t.start()

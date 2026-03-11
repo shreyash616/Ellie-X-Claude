@@ -714,6 +714,27 @@ class EllieApp:
         self._status_var.set(text)
         self._status_lbl.config(fg=color)
 
+    def _start_label_anim(self, text: str, color: str) -> None:
+        self._anim_running = True
+        self._anim_idx = 0
+        frames = ["   ", ".  ", ".. ", "..."]
+
+        def _tick():
+            if not getattr(self, "_anim_running", False):
+                return
+            self._model_lbl.config(
+                text=f"{text}{frames[self._anim_idx % len(frames)]}", fg=color
+            )
+            self._anim_idx += 1
+            self._anim_id = self.root.after(400, _tick)
+
+        _tick()
+
+    def _stop_label_anim(self) -> None:
+        self._anim_running = False
+        if hasattr(self, "_anim_id"):
+            self.root.after_cancel(self._anim_id)
+
     # ── Model loading + audio bootstrap ───────────────────────────────────
 
     def _start_voice_thread(self):
@@ -736,12 +757,11 @@ class EllieApp:
             cmd_device = "cpu"
             cmd_compute = "int8"
 
-        self.root.after(0, lambda: self._model_lbl.config(text="Warming up …"))
+        self.root.after(0, lambda: self._start_label_anim("Warming up", "#fab387"))
         self.model = WhisperModel(cmd_model_size, device=cmd_device, compute_type=cmd_compute)
-        self.root.after(
-            0, lambda: self._model_lbl.config(text="Almost ready — tuning ears …", fg="#f9e2af")
-        )
+        self.root.after(0, lambda: self._start_label_anim("Tuning ears", "#f9e2af"))
         self._wake_model = WhisperModel(WAKE_MODEL_SIZE, device="cpu", compute_type="int8")
+        self.root.after(0, self._stop_label_anim)
 
         threading.Thread(target=self._record_loop, daemon=True).start()
         keyboard.on_press_key(HOTKEY, self._on_f9_press)
