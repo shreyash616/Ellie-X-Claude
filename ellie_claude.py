@@ -621,6 +621,10 @@ class EllieApp:
         self._cancel_event = threading.Event()
         self._last_sent_at: float = 0.0
 
+        # Mic health tracking
+        self._mic_connected: bool = False
+        self._diagnostics_done: bool = False
+
         # Rolling buffer for wake-word analysis
         _wake_cap = int(WAKE_WINDOW_S * SAMPLE_RATE)
         self._wake_buf: collections.deque[np.ndarray] = collections.deque(maxlen=_wake_cap)
@@ -745,53 +749,201 @@ class EllieApp:
         keyboard.on_press_key(PTT_HOTKEY, self._on_f10_press)
         keyboard.on_press_key(STOP_HOTKEY, self._on_stop_key)
 
-        self._enter_active(ready=True)
+        self._run_diagnostics()
 
     # ── Shared audio stream ────────────────────────────────────────────────
 
     def _record_loop(self):
-        try:
-            stream_ctx = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32")
-            stream_ctx.__enter__()
-        except Exception as exc:
-            msg = f"No microphone found: {exc}"
-            print(f"[audio] {msg}")
-            self.root.after(
-                0,
-                lambda: (
-                    self._set_status("⚠ Can't hear you", "#f38ba8"),
-                    self._model_lbl.config(
-                        text="Connect a microphone to talk to Ellie", fg="#f38ba8"
-                    ),
-                ),
-            )
-            return
+        """Continuously read from the mic. Retries on disconnect; notifies UI on state changes."""
+        RETRY_S = 2.0
 
-        try:
-            stream = stream_ctx
-            while True:
-                chunk, _ = stream.read(512)
-                chunk = chunk.copy().flatten()
-                with self._lock:
-                    self._wake_buf.extend(chunk.tolist())
-                    if self._state in ("active", "recording_ptt"):
-                        self._frames.append(chunk)
-        except Exception as exc:
-            print(f"[audio] stream error: {exc}")
+        while True:
+            # Try to open the mic stream
+            try:
+                stream_ctx = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32")
+                stream_ctx.__enter__()
+            except Exception:
+                if self._mic_connected:
+                    self._mic_connected = False
+                    self.root.after(0, self._on_mic_disconnected)
+                time.sleep(RETRY_S)
+                continue
+
+            # Stream opened — mark connected and notify if this is a reconnect
+            was_connected = self._mic_connected
+            self._mic_connected = True
+            if not was_connected and self._diagnostics_done:
+                self.root.after(0, self._on_mic_reconnected)
+
+            # Read loop
+            try:
+                while True:
+                    chunk, _ = stream_ctx.read(512)
+                    chunk = chunk.copy().flatten()
+                    with self._lock:
+                        self._wake_buf.extend(chunk.tolist())
+                        if self._state in ("active", "recording_ptt", "diagnosing"):
+                            self._frames.append(chunk)
+            except Exception as exc:
+                print(f"[audio] stream error: {exc}")
+            finally:
+                self._mic_connected = False
+                if self._diagnostics_done:
+                    self.root.after(0, self._on_mic_disconnected)
+                try:
+                    stream_ctx.__exit__(None, None, None)
+                except Exception:
+                    pass
+
+            time.sleep(RETRY_S)
+
+    def _on_mic_disconnected(self):
+        """Called on the main thread when the mic is unplugged during normal operation."""
+        with self._lock:
+            state = self._state
+            if state in ("active", "recording_ptt"):
+                self._cancel_event.set()
+                self._state = "ptt_idle"
+                self._frames.clear()
+                self._cancel_event.clear()
+        self._set_status("⚠ Microphone disconnected", "#f38ba8")
+        self._model_lbl.config(
+            text="Reconnect your microphone — Ellie will detect it automatically", fg="#f38ba8"
+        )
+
+    def _on_mic_reconnected(self):
+        """Called on the main thread when the mic is plugged back in during normal operation."""
+        self._set_status("✓ Microphone reconnected", "#a6e3a1")
+        self._model_lbl.config(
+            text=f'Mic back  |  say "{WAKE_WORD_USER}" or press F10', fg="#a6e3a1"
+        )
+
+    # ── Startup diagnostics ────────────────────────────────────────────────
+
+    def _run_diagnostics(self):
+        """Ask the user to say something to verify mic + transcription work before going live."""
+        while True:
+            # Phase 1: wait for a mic to appear
+            if not self._mic_connected:
+                self.root.after(
+                    0,
+                    lambda: (
+                        self._set_status("⚠ No microphone found", "#f38ba8"),
+                        self._model_lbl.config(
+                            text="Connect a microphone — Ellie will detect it automatically",
+                            fg="#f38ba8",
+                        ),
+                    ),
+                )
+                while not self._mic_connected:
+                    time.sleep(0.3)
+
+            # Phase 2: prompt user to speak
             self.root.after(
                 0,
                 lambda: (
-                    self._set_status("⚠ Lost hearing", "#f38ba8"),
+                    self._set_status("🎤 Say anything to test your mic…", "#cba6f7"),
                     self._model_lbl.config(
-                        text="Ellie lost her hearing — reconnect the mic and restart", fg="#f38ba8"
+                        text="Speak a few words so Ellie can verify your microphone", fg="#f9e2af"
                     ),
                 ),
             )
-        finally:
+            with self._lock:
+                self._state = "diagnosing"
+                self._frames.clear()
+
+            started = time.time()
+            got_speech = False
+            silence_since: float | None = None
+            mic_lost = False
+
+            while time.time() - started < 15.0:
+                time.sleep(0.1)
+
+                if not self._mic_connected:
+                    mic_lost = True
+                    break
+
+                with self._lock:
+                    frames = list(self._frames)
+
+                if sum(len(f) for f in frames) / SAMPLE_RATE < 0.3:
+                    continue
+
+                recent = np.concatenate(frames)[-int(0.3 * SAMPLE_RATE) :]
+                rms = float(np.sqrt(np.mean(recent**2)))
+
+                if rms >= SILENCE_RMS:
+                    if not got_speech:
+                        got_speech = True
+                        self.root.after(
+                            0, lambda: self._set_status("◎ Got it, analyzing…", "#fab387")
+                        )
+                    silence_since = None
+                elif got_speech:
+                    if silence_since is None:
+                        silence_since = time.time()
+                    elif time.time() - silence_since >= 1.0:
+                        break
+
+            with self._lock:
+                frames = list(self._frames)
+                self._frames.clear()
+                self._state = "ptt_idle"
+
+            if mic_lost:
+                self.root.after(
+                    0,
+                    lambda: (
+                        self._set_status("⚠ Microphone disconnected during setup", "#f38ba8"),
+                        self._model_lbl.config(
+                            text="Reconnect your mic to continue setup", fg="#f38ba8"
+                        ),
+                    ),
+                )
+                continue  # loop back to wait for mic
+
+            if not got_speech:
+                self.root.after(
+                    0,
+                    lambda: (
+                        self._set_status("⚠ Couldn't hear you — retrying…", "#f38ba8"),
+                        self._model_lbl.config(
+                            text="Make sure your mic is not muted, then speak", fg="#f38ba8"
+                        ),
+                    ),
+                )
+                time.sleep(2.0)
+                continue
+
+            # Phase 3: transcribe the test utterance
+            self.root.after(0, lambda: self._set_status("◎ Checking transcription…", "#fab387"))
             try:
-                stream_ctx.__exit__(None, None, None)
-            except Exception:
-                pass
+                audio = np.concatenate(frames).flatten()
+                segs, _ = self.model.transcribe(audio, beam_size=5, language="en")
+                text = " ".join(s.text.strip() for s in segs).strip()
+            except Exception as exc:
+                err = str(exc)
+                self.root.after(
+                    0,
+                    lambda e=err: (
+                        self._set_status("⚠ Transcription error — retrying…", "#f38ba8"),
+                        self._model_lbl.config(text=f"Error: {e}", fg="#f38ba8"),
+                    ),
+                )
+                time.sleep(2.0)
+                continue
+
+            # Success — everything works
+            self._diagnostics_done = True
+            preview = (text[:40] + "…") if text and len(text) > 40 else (text or "…")
+            self.root.after(
+                0,
+                lambda p=preview: self._set_status(f'✓ Heard: "{p}" — Starting…', "#a6e3a1"),
+            )
+            time.sleep(1.5)
+            self._enter_active(ready=True)
+            return
 
     # ── Mode switching ─────────────────────────────────────────────────────
 
@@ -801,6 +953,7 @@ class EllieApp:
             self._cancel_event.set()
             self._state = "active"
             self._frames.clear()
+            self._cancel_event.clear()
         if ready:
             self.root.after(
                 0,
@@ -821,6 +974,7 @@ class EllieApp:
             self._cancel_event.set()
             self._state = "ptt_idle"
             self._frames.clear()
+            self._cancel_event.clear()
         _tone_error()
         self.root.after(0, lambda: self._set_status("● Tap F9 to speak", "#45475a"))
 
@@ -851,22 +1005,27 @@ class EllieApp:
 
     # ── Escape — stop listening ────────────────────────────────────────────
 
-    def _stop_listening(self):
-        """Cancel any active recording and switch to push-to-talk mode."""
-        with self._lock:
-            if self._state in ("ptt_idle", "transcribing"):
-                return
-            self._cancel_event.set()
-            self._state = "ptt_idle"
-            self._frames.clear()
-        _tone_error()
-        self.root.after(0, lambda: self._set_status("● Tap F9 to speak", "#45475a"))
-
     def _on_stop_key(self, _):
         with self._lock:
             state = self._state
-        if state in ("active", "recording_ptt"):
-            self._stop_listening()
+        if state == "active":
+            # ESC in active mode: cancel current recording, restart wake word listening
+            with self._lock:
+                self._cancel_event.set()
+                self._state = "active"
+                self._frames.clear()
+                self._cancel_event.clear()
+            _tone_error()
+            self._enter_active()
+        elif state == "recording_ptt":
+            # ESC in PTT mode: cancel recording, return to PTT idle
+            with self._lock:
+                self._cancel_event.set()
+                self._state = "ptt_idle"
+                self._frames.clear()
+                self._cancel_event.clear()
+            _tone_error()
+            self.root.after(0, lambda: self._set_status("● Tap F9 to speak", "#45475a"))
 
     # ── Active listening loop (wake-word gated) ────────────────────────────
 
@@ -1011,11 +1170,19 @@ class EllieApp:
         """Transcribe audio and send to terminal. return_to is 'active' or 'ptt'."""
         text: str | None = None
 
+        def _reset_to_mode():
+            """Return to the idle state of whichever mode was active."""
+            if return_to == "active":
+                self._enter_active()
+            else:
+                self.root.after(0, lambda: self._set_status("● Tap F9 to speak", "#45475a"))
+
         def _on_timeout():
             with self._lock:
                 if self._state == "transcribing":
                     self._state = "ptt_idle"
-            self.root.after(0, lambda: self._set_status("● Tap F9 to speak", "#45475a"))
+            self.root.after(0, lambda: self._set_status("⚠ Timed out", "#f38ba8"))
+            threading.Timer(5.0, _reset_to_mode).start()
 
         _timer = threading.Timer(30.0, _on_timeout)
         _timer.daemon = True
@@ -1091,10 +1258,8 @@ class EllieApp:
                 self.root.after(0, lambda: self._set_status("● Tap F9 to speak", "#45475a"))
         else:
             _tone_error()
-            if return_to == "active":
-                self._enter_active()
-            else:
-                self.root.after(0, lambda: self._set_status("● Tap F9 to speak", "#45475a"))
+            self.root.after(0, lambda: self._set_status("⚠ Couldn't understand …", "#f38ba8"))
+            threading.Timer(5.0, _reset_to_mode).start()
 
     # ── Startup registration ───────────────────────────────────────────────
 
