@@ -635,7 +635,6 @@ class EllieApp:
         self._terminal: TerminalWidget | None = None
 
         self._build_ui()
-        self._register_startup()
         self._start_voice_thread()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.mainloop()
