@@ -46,7 +46,7 @@ from winpty import PtyProcess  # noqa: E402
 SAMPLE_RATE = 16_000
 HOTKEY = "f9"
 WAKE_MODEL_SIZE = "tiny.en"
-WAKE_WORD_USER = "hey ellie"
+WAKE_WORD_USER = "okay ellie"
 WAKE_WORD = "ellie"
 WAKE_WINDOW_S = 2.0
 WAKE_STEP_S = 0.5
